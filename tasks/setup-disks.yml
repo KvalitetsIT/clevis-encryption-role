@@ -11,7 +11,7 @@
 - name: "Bind {{ disk_device }} to Tang"
   ansible.builtin.shell: |
     clevis luks bind -d "/dev/{{ disk_device }}" -k "{{ ansible_luks_key_path }}" sss \
-    '{"t": 1, "pins": {"tang": [ {% for url_adv in tang_servers %}{"url": "{{ url_adv.url }}","adv":"{{ url_adv.adv }}"}{% if not loop.last %},{% endif %}{% endfor %}]}}'
+    '{{ tang_sss_cfg }}'
   args:
     executable: /bin/bash
 
@@ -55,7 +55,7 @@
   ansible.builtin.lineinfile:
     path: /etc/crypttab
     line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,nofail,_netdev"
-    create: yes
+    create: true
     mode: '0600'
     owner: root
     group: root
