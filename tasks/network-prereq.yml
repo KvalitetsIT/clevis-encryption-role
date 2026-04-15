@@ -1,0 +1,106 @@
+---
+# Deploys (or removes) the clevis-network-ready.service gate.
+#
+# PURPOSE
+# -------
+# On dual-stack hosts (e.g. Hetzner), getaddrinfo() returns AAAA records
+# before A records.  If net.ipv6.conf.all.disable_ipv6=1 is set in
+# /etc/sysctl.d/ but systemd-sysctl.service hasn't completed yet when
+# clevis-luks-askpass.service starts, clevis may attempt Tang requests over
+# IPv6 — which fails if the Tang server's whitelist is IPv4-only.
+#
+# This unit acts as an explicit gate: it runs After=systemd-sysctl.service
+# and Before=clevis-luks-askpass.service, then verifies the sysctl setting is
+# actually in effect.  If the check fails, clevis is blocked — forcing the
+# operator to fix the sysctl configuration rather than silently failing at
+# unlock time.
+#
+# DESIGN
+# ------
+# Controlled by clevis_ipv4_only (defaults to false).  When false, any
+# previously deployed gate is removed so the role stays idempotent and the
+# host reverts to standard network ordering.
+#
+# A separate drop-in file (ipv4-only.conf) is written to the
+# clevis-luks-askpass.service.d directory rather than modifying the existing
+# network-online.conf — keeping concerns separated and making the gate purely
+# additive.
+#
+# Called from the boot-ordering block in tasks/main.yml, after the per-disk
+# configure-disk.yml loop (which creates the drop-in directory).
+
+- name: "Deploy IPv4-only network gate for Clevis"
+  when: clevis_ipv4_only | default(false) | bool
+  block:
+
+    - name: "Install clevis-network-ready.service"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/clevis-network-ready.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Verify IPv6 is disabled before Clevis Tang unlock requests
+          Documentation=man:sysctl(8) man:clevis-luks-askpass(8)
+          # Run after the sysctl service has applied /etc/sysctl.d/ settings,
+          # and after the network stack is fully online.  Both are needed:
+          # systemd-sysctl.service ensures the kernel flag is set, and
+          # network-online.target ensures any pending interface configuration
+          # (which can re-enable IPv6 on new interfaces) has settled.
+          After=systemd-sysctl.service network-online.target
+          Wants=network-online.target
+          # Ordering: this unit must complete before clevis-luks-askpass starts.
+          Before=clevis-luks-askpass.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          # Read the live kernel value rather than parsing a config file — this
+          # confirms the setting is in effect, not merely written to disk.
+          ExecStart=/bin/sh -c 'sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -qx 1'
+
+          [Install]
+          # Pulled in automatically when clevis-luks-askpass.service is enabled.
+          WantedBy=clevis-luks-askpass.service
+      notify: "Reload systemd daemon"
+
+    - name: "Enable clevis-network-ready.service"
+      ansible.builtin.systemd:
+        name: clevis-network-ready.service
+        enabled: true
+        daemon_reload: false
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: "Add clevis-luks-askpass drop-in: require network gate"
+      # Separate drop-in file so it can be removed independently of the
+      # network-online.conf ordering that configure-disk.yml manages.
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          # Block unlock attempts until clevis-network-ready has confirmed that
+          # IPv6 is disabled.  This prevents getaddrinfo() from selecting an
+          # IPv6 address for Tang servers that are IPv4-whitelisted only.
+          After=clevis-network-ready.service
+          Wants=clevis-network-ready.service
+      notify: "Reload systemd daemon"
+
+- name: "Remove IPv4-only network gate (clevis_ipv4_only is false)"
+  when: not (clevis_ipv4_only | default(false) | bool)
+  block:
+
+    - name: "Remove clevis-network-ready.service if present"
+      ansible.builtin.file:
+        path: /etc/systemd/system/clevis-network-ready.service
+        state: absent
+      notify: "Reload systemd daemon"
+
+    - name: "Remove ipv4-only drop-in from clevis-luks-askpass if present"
+      ansible.builtin.file:
+        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
+        state: absent
+      notify: "Reload systemd daemon"
