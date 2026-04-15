@@ -1,0 +1,64 @@
+---
+# Creates the ZFS pool on top of the LUKS mapper devices and registers it with
+# Proxmox.  Also writes the per-device systemd override for zfs-import-cache
+# that lists explicit device unit dependencies alongside the target-level
+# After=remote-cryptsetup.target set by configure-disk.yml.
+#
+# Called once from the provisioning block in tasks/main.yml after all disks
+# have been provisioned and opened by provision-disk.yml.
+#
+# Expects in scope:
+#   clevis_pool_name  — ZFS pool name (default: "data", from defaults/main.yml)
+#   clevis_raw_disks  — list of bare device names set by main.yml pre-flight
+#
+# Assumes /dev/mapper/crypt-<device> exists for each entry in clevis_raw_disks.
+#
+# Idempotent: pool creation and pvesm add are guarded by existence checks.
+
+- name: "Apply per-device ZFS import ordering override"
+  # Complements after-luks-unlock.conf (which uses the high-level
+  # remote-cryptsetup.target) with explicit device unit dependencies so
+  # systemd also waits for each individual mapper device to be present.
+  ansible.builtin.blockinfile:
+    path: /etc/systemd/system/zfs-import-cache.service.d/override.conf
+    create: true
+    mode: '0644'
+    block: |
+      [Unit]
+      Wants=remote-cryptsetup.target
+      After=remote-cryptsetup.target
+      {% for disk in clevis_raw_disks %}
+      Wants=dev-mapper-crypt\x2d{{ disk }}.device
+      After=dev-mapper-crypt\x2d{{ disk }}.device
+      {% endfor %}
+  notify: "Reload systemd daemon"
+
+- name: "Check if ZFS pool '{{ clevis_pool_name }}' already exists"
+  ansible.builtin.command: zpool list {{ clevis_pool_name }}
+  register: clevis_pool_exists
+  changed_when: false
+  failed_when: false
+
+- name: "Create ZFS pool '{{ clevis_pool_name }}' (stripe of mirrors)"
+  ansible.builtin.command: >
+    zpool create {{ clevis_pool_name }}
+    mirror /dev/mapper/crypt-{{ clevis_raw_disks[0] }} /dev/mapper/crypt-{{ clevis_raw_disks[1] }}
+    mirror /dev/mapper/crypt-{{ clevis_raw_disks[2] }} /dev/mapper/crypt-{{ clevis_raw_disks[3] }}
+    mirror /dev/mapper/crypt-{{ clevis_raw_disks[4] }} /dev/mapper/crypt-{{ clevis_raw_disks[5] }}
+  when: clevis_pool_exists.rc != 0
+
+- name: "Enable ZFS cachefile for '{{ clevis_pool_name }}'"
+  ansible.builtin.command: "zpool set cachefile=/etc/zfs/zpool.cache {{ clevis_pool_name }}"
+  when: clevis_pool_exists.rc != 0
+
+- name: "Register '{{ clevis_pool_name }}' with Proxmox storage"
+  ansible.builtin.command: >
+    pvesm add zfspool {{ clevis_pool_name }}
+    -pool {{ clevis_pool_name }}
+    -content images,rootdir
+    -sparse 1
+  register: pvesm_add
+  failed_when:
+    - pvesm_add.rc != 0
+    - "'already exists' not in pvesm_add.stderr"
+  changed_when: pvesm_add.rc == 0
