@@ -235,11 +235,63 @@
       tags: [systemd]
       block:
 
-        - name: "Configure crypttab and systemd drop-ins for {{ item }}"
+        - name: "Configure crypttab and live discard for {{ item }}"
           ansible.builtin.include_tasks: configure-disk.yml
           loop: "{{ clevis_raw_disks }}"
           loop_control:
             loop_var: disk_device
+
+        # ── clevis-luks-askpass network gate ───────────────────────────────
+        # Disk-independent: written once here, not inside the per-disk loop.
+        # Belt-and-suspenders: the clevis service will not attempt tang until
+        # the network is fully online, regardless of crypttab ordering.
+
+        - name: "Create systemd drop-in directory for clevis-luks-askpass"
+          ansible.builtin.file:
+            path: /etc/systemd/system/clevis-luks-askpass.service.d
+            state: directory
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: "clevis-luks-askpass: wait for network-online before attempting Tang"
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              After=network-online.target
+              Wants=network-online.target
+          notify: "Reload systemd daemon"
+
+        # ── ZFS import ordering ────────────────────────────────────────────
+        # remote-cryptsetup.target is reached after every crypt unit either
+        # unlocks or times out (nofail).  Ordering zfs-import-cache after it
+        # ensures ZFS always sees the mapper devices before pool import.
+
+        - name: "Create systemd drop-in directory for zfs-import-cache"
+          ansible.builtin.file:
+            path: /etc/systemd/system/zfs-import-cache.service.d
+            state: directory
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: "zfs-import-cache: run after all LUKS devices unlock or time out"
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              # Wait for all remote-encrypted volumes to either unlock or time out
+              # (nofail) before attempting pool import.  Without this, zfs-import-cache
+              # runs while the mapper devices are still absent and the import fails.
+              After=remote-cryptsetup.target
+          notify: "Reload systemd daemon"
 
         - name: "Enable clevis-luks-askpass.path for late-boot unlock"
           ansible.builtin.systemd:

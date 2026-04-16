@@ -2,19 +2,19 @@
 # Configures boot-time integration for a single encrypted data disk:
 #   - /etc/crypttab entry with correct network-ordering flags
 #   - Live discard passthrough applied to running mapper (no reboot needed)
-#   - systemd drop-in: clevis-luks-askpass waits for network-online.target
-#   - systemd drop-in: zfs-import-cache runs after remote-cryptsetup.target
 #
 # Called from tasks/main.yml inside the boot-ordering block, once per disk via
 # include_tasks loop.  The loop variable is disk_device (bare name, e.g. nvme0n1).
 #
-# Idempotent: lineinfile (with regexp) replaces any existing crypttab entry for
-# this device regardless of its current flags; copy tasks are no-ops when the
-# destination already matches; cryptsetup refresh is only called when the mapper
-# is open and discard is not already active.  The raw device does not need to be
-# open — only blkid is called against it to read the UUID.
+# Disk-independent systemd drop-ins (clevis-luks-askpass network gate,
+# zfs-import-cache ordering) are written once in main.yml after this loop —
+# they must not live here as they would be applied redundantly for every disk.
 #
-# Tasks that write systemd files notify the "Reload systemd daemon" handler.
+# Idempotent: lineinfile (with regexp) replaces any existing crypttab entry for
+# this device regardless of its current flags; cryptsetup refresh is only called
+# when the mapper is open and discard is not already active.  The raw device
+# does not need to be open — only blkid is called against it to read the UUID.
+#
 # The crypttab task notifies "Rebuild initramfs" so the initrd stays consistent
 # with /etc/crypttab (clevis-initramfs bakes a copy of crypttab into the initrd).
 # For _netdev data disks the initramfs phase skips these entries anyway, so a
@@ -22,7 +22,7 @@
 #
 # Reboot note:
 #   Discard is applied to the running mapper immediately (cryptsetup refresh).
-#   New crypttab flags and systemd ordering take effect at next boot.
+#   New crypttab flags take effect at next boot.
 #   dm-crypt workqueue and CPU-pinning tuning belong in proxmox-storage-tuning
 #   and may require a scheduled maintenance reboot.
 
@@ -30,6 +30,7 @@
   ansible.builtin.command: blkid -s UUID -o value "/dev/{{ disk_device }}"
   register: disk_uuid
   changed_when: false
+  check_mode: false
 
 - name: "{{ disk_device }}: write /etc/crypttab entry"
   ansible.builtin.lineinfile:
@@ -98,54 +99,3 @@
     - _mapper_status.stdout is defined
     - "'discards' not in _mapper_status.stdout"
   changed_when: true
-
-# ── clevis-luks-askpass network gate ─────────────────────────────────────────
-# Belt-and-suspenders: the clevis service will not attempt tang until the
-# network is fully online, regardless of crypttab ordering.
-
-- name: "Create systemd drop-in directory for clevis-luks-askpass"
-  ansible.builtin.file:
-    path: /etc/systemd/system/clevis-luks-askpass.service.d
-    state: directory
-    mode: '0755'
-    owner: root
-    group: root
-
-- name: "clevis-luks-askpass: wait for network-online before attempting Tang"
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
-    owner: root
-    group: root
-    mode: '0644'
-    content: |
-      [Unit]
-      After=network-online.target
-      Wants=network-online.target
-  notify: "Reload systemd daemon"
-
-# ── ZFS import ordering ───────────────────────────────────────────────────────
-# remote-cryptsetup.target is reached after every crypt unit either unlocks or
-# times out (nofail).  Ordering zfs-import-cache after it ensures ZFS always
-# sees the mapper devices before attempting pool import.
-
-- name: "Create systemd drop-in directory for zfs-import-cache"
-  ansible.builtin.file:
-    path: /etc/systemd/system/zfs-import-cache.service.d
-    state: directory
-    mode: '0755'
-    owner: root
-    group: root
-
-- name: "zfs-import-cache: run after all LUKS devices unlock or time out"
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
-    owner: root
-    group: root
-    mode: '0644'
-    content: |
-      [Unit]
-      # Wait for all remote-encrypted volumes to either unlock or time out
-      # (nofail) before attempting pool import.  Without this, zfs-import-cache
-      # runs while the mapper devices are still absent and the import fails.
-      After=remote-cryptsetup.target
-  notify: "Reload systemd daemon"
