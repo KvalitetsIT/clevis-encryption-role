@@ -90,9 +90,13 @@
   #   server and unlocks the key slot to authorize the refresh.
   # --allow-discards: enables TRIM passthrough on the live dm-crypt device.
   #   Takes effect immediately without interrupting I/O or closing the mapper.
+  # --persistent: writes allow-discards into the LUKS2 header persistent flags
+  #   so the setting is applied on every future activation regardless of
+  #   crypttab.  Defense in depth alongside the crypttab discard option.
+  #   LUKS2 only — all disks provisioned by this role use LUKS2.
   # Idempotent: skipped if 'discards' is already listed in the active flags.
   ansible.builtin.command: >
-    cryptsetup refresh --token-only --allow-discards crypt-{{ disk_device }}
+    cryptsetup refresh --token-only --allow-discards --persistent crypt-{{ disk_device }}
   when:
     - _mapper_status.rc == 0
     - "'discards' not in _mapper_status.stdout"
