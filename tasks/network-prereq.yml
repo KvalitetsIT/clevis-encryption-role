@@ -69,7 +69,10 @@
       ansible.builtin.systemd:
         name: clevis-network-ready.service
         enabled: true
-        daemon_reload: false
+        # daemon_reload: true — the service file was just written above; without
+        # reloading, systemd does not yet know the unit exists and the enable
+        # call fails with "Could not find the requested service".
+        daemon_reload: true
       ignore_errors: "{{ ansible_check_mode }}"
 
     - name: "Add clevis-luks-askpass drop-in: require network gate"
