@@ -33,18 +33,40 @@
       {% endfor %}
   notify: "Reload systemd daemon"
 
+- name: "Build ZFS vdev specification from discovered disks"
+  # Generates the vdev argument string for zpool create based on
+  # clevis_zfs_pool_topology and the disks discovered in main.yml.
+  #
+  #   mirror  → mirror dev0 dev1 [mirror dev2 dev3 ...]   (pairs)
+  #   raidz   → raidz  dev0 dev1 dev2 ...                 (single vdev)
+  #   raidz2  → raidz2 dev0 dev1 dev2 ...
+  #   raidz3  → raidz3 dev0 dev1 dev2 ...
+  #   stripe  → dev0 dev1 dev2 ...                        (no keyword)
+  ansible.builtin.set_fact:
+    _clevis_vdev_spec: >-
+      {%- set devs = clevis_raw_disks | map('regex_replace', '^(.*)$', '/dev/mapper/crypt-\1') | list -%}
+      {%- if clevis_zfs_pool_topology == 'mirror' -%}
+        {%- set vdevs = [] -%}
+        {%- for i in range(0, devs | length, 2) -%}
+          {%- if i + 1 < devs | length -%}
+            {%- set _ = vdevs.append('mirror ' ~ devs[i] ~ ' ' ~ devs[i + 1]) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ vdevs | join(' ') }}
+      {%- elif clevis_zfs_pool_topology in ['raidz', 'raidz2', 'raidz3'] -%}
+        {{ clevis_zfs_pool_topology }} {{ devs | join(' ') }}
+      {%- else -%}
+        {{ devs | join(' ') }}
+      {%- endif -%}
+
 - name: "Check if ZFS pool '{{ clevis_pool_name }}' already exists"
   ansible.builtin.command: zpool list {{ clevis_pool_name }}
   register: clevis_pool_exists
   changed_when: false
   failed_when: false
 
-- name: "Create ZFS pool '{{ clevis_pool_name }}' (stripe of mirrors)"
-  ansible.builtin.command: >
-    zpool create {{ clevis_pool_name }}
-    mirror /dev/mapper/crypt-{{ clevis_raw_disks[0] }} /dev/mapper/crypt-{{ clevis_raw_disks[1] }}
-    mirror /dev/mapper/crypt-{{ clevis_raw_disks[2] }} /dev/mapper/crypt-{{ clevis_raw_disks[3] }}
-    mirror /dev/mapper/crypt-{{ clevis_raw_disks[4] }} /dev/mapper/crypt-{{ clevis_raw_disks[5] }}
+- name: "Create ZFS pool '{{ clevis_pool_name }}' ({{ clevis_zfs_pool_topology }})"
+  ansible.builtin.command: "zpool create {{ clevis_pool_name }} {{ _clevis_vdev_spec }}"
   when: clevis_pool_exists.rc != 0
 
 - name: "Enable ZFS cachefile for '{{ clevis_pool_name }}'"
@@ -62,3 +84,4 @@
     - pvesm_add.rc != 0
     - "'already exists' not in pvesm_add.stderr"
   changed_when: pvesm_add.rc == 0
+  when: clevis_register_proxmox_storage | default(false) | bool

@@ -146,15 +146,15 @@
             - "net.ipv6.conf.default.disable_ipv6"
             - "net.ipv6.conf.all.disable_ipv6"
 
-        - name: "Ensure load-balanced nameservers are present"
+        - name: "Prepend provisioning nameservers to /etc/resolv.conf"
           ansible.builtin.lineinfile:
             path: /etc/resolv.conf
             line: "nameserver {{ item }}"
             insertbefore: '^nameserver'
             firstmatch: true
             state: present
-          loop: "{{ dnshosts | shuffle(seed=inventory_hostname) }}"
-          when: dnshosts is defined
+          loop: "{{ clevis_dns_servers | shuffle(seed=inventory_hostname) }}"
+          when: clevis_dns_servers | length > 0
 
         # --- Tang advertisement fetch and SSS assembly ------------------------
         - name: "Fetch advertisement keys from Tang servers"

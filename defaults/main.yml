@@ -28,6 +28,36 @@ clevis_keep_temp_key: false
 # This is a destructive flag — see destroy-pool.yml.
 clevis_destroy_existing: false
 
+# ── ZFS pool topology ─────────────────────────────────────────────────────────
+# Controls how discovered data disks are arranged into vdevs.
+# Supported values:
+#   mirror  — pairs of disks become mirror vdevs (e.g. 6 disks → 3 mirrors).
+#             Best for read performance and redundancy.  Requires an even
+#             number of disks.
+#   raidz   — all disks in a single raidz vdev (1 parity disk).
+#   raidz2  — all disks in a single raidz2 vdev (2 parity disks).
+#   raidz3  — all disks in a single raidz3 vdev (3 parity disks).
+#   stripe  — no redundancy; all disks striped (data loss on any single disk).
+clevis_zfs_pool_topology: "mirror"
+
+# ── Proxmox storage registration ─────────────────────────────────────────────
+# Set to true to run 'pvesm add zfspool' after pool creation, registering the
+# pool as a Proxmox VE storage backend.  Set false when using this role on
+# non-Proxmox Debian hosts.
+clevis_register_proxmox_storage: false
+
+# ── DNS servers for provisioning ─────────────────────────────────────────────
+# Optional list of nameservers to prepend to /etc/resolv.conf during the
+# provisioning run.  Useful when Tang servers are reachable only via an
+# internal DNS zone that is not in the host's default resolver config.
+# Leave empty (the default) to leave /etc/resolv.conf unchanged.
+#
+# Example:
+#   clevis_dns_servers:
+#     - "10.20.20.1"
+#     - "10.20.20.2"
+clevis_dns_servers: []
+
 # Set to true to deploy a clevis-network-ready.service gate that verifies
 # IPv6 is disabled (sysctl net.ipv6.conf.all.disable_ipv6=1) before
 # clevis-luks-askpass.service is allowed to make Tang unlock requests.
