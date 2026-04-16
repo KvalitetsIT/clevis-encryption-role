@@ -134,7 +134,12 @@
           become: false
 
         # --- Network prerequisites for Tang ------------------------------------
-        - name: "Disable IPv6 (required for stable Tang connectivity)"
+        - name: "Disable IPv6 for Tang provisioning (clevis_ipv4_only=true)"
+          # Only applied when Tang servers are IPv4-only (e.g. Hetzner dual-stack
+          # hosts where the Tang whitelist only accepts IPv4 connections).
+          # When clevis_ipv4_only is false, IPv6 is left untouched — Tang may be
+          # reachable over IPv6 or the host may be a single-stack IPv4 environment
+          # that needs no explicit sysctl gate.
           ansible.posix.sysctl:
             name: "{{ item }}"
             value: '1'
@@ -145,6 +150,7 @@
           loop:
             - "net.ipv6.conf.default.disable_ipv6"
             - "net.ipv6.conf.all.disable_ipv6"
+          when: clevis_ipv4_only | default(false) | bool
 
         - name: "Prepend provisioning nameservers to /etc/resolv.conf"
           ansible.builtin.lineinfile:
