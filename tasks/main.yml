@@ -61,6 +61,9 @@
     - name: "Discover raw physical data disks (largest size group)"
       # Filters out removable, virtual, and already-mapped devices, then groups
       # by size and selects the largest group — the data disks.
+      # tags: always — this fact is consumed by both the provisioning and
+      # systemd blocks; without it the --tags systemd path has no disk list.
+      tags: always
       ansible.builtin.set_fact:
         clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
       vars:
