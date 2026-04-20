@@ -39,17 +39,18 @@
   block:
 
     - name: "Prefer IPv4 over IPv6 in getaddrinfo (gai.conf)"
-      # Setting precedence 100 for IPv4-mapped addresses (::ffff:0:0/96) makes
-      # getaddrinfo() return A records before AAAA records on dual-stack hosts.
-      # The default Debian gai.conf gives native IPv6 higher precedence (50)
-      # than IPv4-mapped (10); raising IPv4-mapped to 100 reverses this.
-      # This is the standard, application-agnostic mechanism — no sysctl
-      # timing issues, no address flushing needed.
-      ansible.builtin.lineinfile:
+      # Two lines are required — raising IPv4-mapped alone is not sufficient:
+      # glibc may fall back to a built-in default of 40 for ::/0 (native IPv6),
+      # and RFC 6724 Rule 5 (prefer matching label) can still favour IPv6 before
+      # Rule 6 (precedence) is even reached.  Explicitly setting ::/0 to 1
+      # ensures native IPv6 addresses lose to IPv4-mapped (100) at Rule 6
+      # regardless of which path the glibc sort takes.
+      ansible.builtin.blockinfile:
         path: /etc/gai.conf
-        regexp: '^precedence\s+::ffff:0:0/96\s+'
-        line: 'precedence ::ffff:0:0/96  100'
-        state: present
+        block: |
+          precedence ::ffff:0:0/96  100
+          precedence ::/0           1
+        marker: "# {mark} ANSIBLE MANAGED clevis-encryption ipv4-only"
         create: true
         owner: root
         group: root
@@ -127,10 +128,10 @@
   when: not (clevis_ipv4_only | default(false) | bool)
   block:
 
-    - name: "Remove IPv4 precedence from gai.conf if present"
-      ansible.builtin.lineinfile:
+    - name: "Remove IPv4-only precedence block from gai.conf if present"
+      ansible.builtin.blockinfile:
         path: /etc/gai.conf
-        regexp: '^precedence\s+::ffff:0:0/96\s+'
+        marker: "# {mark} ANSIBLE MANAGED clevis-encryption ipv4-only"
         state: absent
 
     - name: "Remove clevis-network-ready.service if present"
