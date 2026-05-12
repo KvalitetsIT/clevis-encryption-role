@@ -108,6 +108,19 @@
         daemon_reload: true
       ignore_errors: "{{ ansible_check_mode }}"
 
+    - name: "Ensure clevis-luks-askpass.service.d drop-in directory exists"
+      # When network-prereq runs as part of prestage (PR #10), this fires
+      # before the boot-ordering block that also creates this directory.
+      # On hosts that have never had clevis drop-ins before, the ipv4-only.conf
+      # write below would fail with "Destination directory … does not exist".
+      # Idempotent — also safe when the boot-ordering block creates it later.
+      ansible.builtin.file:
+        path: /etc/systemd/system/clevis-luks-askpass.service.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
     - name: "Add clevis-luks-askpass drop-in: require network gate"
       # Separate drop-in file so it can be removed independently of the
       # network-online.conf ordering that configure-disk.yml manages.
