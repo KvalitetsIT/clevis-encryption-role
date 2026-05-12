@@ -89,10 +89,17 @@
 - name: "Insert managed nameservers as a single ANSIBLE-marked block"
   # blockinfile is naturally idempotent: subsequent runs locate the BEGIN/END
   # markers and replace the content between them if it has drifted, rather
-  # than appending.  firstmatch: true with insertbefore puts the managed
-  # block ABOVE any pre-existing nameserver lines so our DNS servers are
-  # queried first.  If resolv.conf has no nameserver lines at all, blockinfile
-  # falls back to BOF (beginning of file).
+  # than appending.
+  #
+  # Placement: insertbefore: BOF puts the block at the very top of the file
+  # so the managed nameservers are queried FIRST by the resolver — required
+  # so Tang hostnames resolve through the internal DNS rather than via the
+  # Hetzner upstream that doesn't know our internal zones.  BOF is also the
+  # only robust choice with blockinfile: the regex-based insertbefore matches
+  # the LAST occurrence (no firstmatch option on this module), which would
+  # place our block AFTER any pre-existing nameservers — defeating the
+  # purpose.  The Hetzner header comment is pushed down a few lines as a
+  # cosmetic side effect, which the resolver does not care about.
   ansible.builtin.blockinfile:
     path: /etc/resolv.conf
     block: |
@@ -100,8 +107,7 @@
       nameserver {{ ns }}
       {% endfor %}
     marker: "# {mark} ANSIBLE MANAGED clevis-encryption nameservers"
-    insertbefore: '^nameserver'
-    firstmatch: true
+    insertbefore: BOF
   when: clevis_dns_servers | length > 0
 
 - name: "Deploy or remove IPv4-only network gate (gai.conf + systemd unit)"
