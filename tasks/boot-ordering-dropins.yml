@@ -21,27 +21,15 @@
 #
 # Idempotent and safe on already-encrypted live systems.
 
-# ── networking-services bring-up gate ───────────────────────────────────────
-# Not all local file systems need to be in place for networking to start.  Bring
-# the network up as early as possible so Clevis can reach the Tang server(s).
-- name: "Create systemd drop-in directory for networking.service"
+# ── Remove the networking.service early bring-up drop-in ────────────────────
+# An earlier attempt reordered networking.service (After= reset to bring the
+# network up before sysinit completed) to speed up Tang reachability.  It was
+# validated to BREAK boot — the network never comes online — so ensure it is
+# absent on every host (including any that already received it).
+- name: "Remove broken networking.service bring-up drop-in (validated to break boot)"
   ansible.builtin.file:
-    path: /etc/systemd/system/networking.service.d
-    state: directory
-    mode: '0755'
-    owner: root
-    group: root
-
-- name: "Bring up networking as early as possible"
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/networking.service.d/10-override.conf
-    owner: root
-    group: root
-    mode: '0644'
-    content: |
-      [Unit]
-      After=
-      After=network-pre.target apparmor.service ifupdown2-pre.service sysinit.target
+    path: /etc/systemd/system/networking.service.d/10-override.conf
+    state: absent
   notify: "Reload systemd daemon"
 
 # ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
