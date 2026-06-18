@@ -50,6 +50,18 @@ clevis_zfs_pool_topology: "mirror"
 # kernel module).
 clevis_ensure_pool: true
 
+# ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
+# clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
+# distinguishing a missing block device from a decrypt failure, and always
+# continues so the ZFS scan-import + pool-health check decide pool viability.
+# Worst-case added boot delay ≈ retries × (attempt_timeout + retry_delay) ×
+# number_of_disks (only when disks actually fail every attempt); a healthy disk
+# unlocks on the first attempt.  Keep the budget modest so a genuinely-down Tang
+# degrades quickly rather than hanging the boot.
+clevis_unlock_retries: 3
+clevis_unlock_retry_delay: 5
+clevis_unlock_attempt_timeout: 20
+
 # ── Proxmox storage registration ─────────────────────────────────────────────
 # This role intentionally does NOT register the pool with Proxmox.  The role's
 # job ends at "imported ZFS pool".  Proxmox-specific concerns live in

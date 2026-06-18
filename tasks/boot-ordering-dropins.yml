@@ -1,18 +1,50 @@
 ---
-# Disk-set systemd drop-ins that gate ZFS pool import on every individual LUKS
-# mapper being unlocked first, plus the clevis-luks-askpass network gate.
+# Disk-SET systemd boot ordering for the encrypted ZFS pool.  Factored out of
+# main.yml so replace-disk.yml can refresh it after the disk set changes.
 #
-# These are disk-SET (not per-disk) units keyed off clevis_raw_disks, so they
-# live here — written once after the per-disk configure-disk.yml loop.  Factored
-# out of main.yml so replace-disk.yml can refresh them after the pool's disk set
-# changes.
+# FAIL-DEGRADED design (see .ignored/encrypted-storage-boot-sync.md + the
+# operator decision recorded there):
+#   network-online
+#     -> clevis-unlock-data.service        (retry Tang per disk; ALWAYS exit 0)
+#     -> zfs-import-scan.service           (scan import, cachefile=none)
+#     -> zfs-mount / zfs.target
+#     -> encrypted-storage-pool-check.svc  (health ONLINE|DEGRADED -> ok)
+#     -> encrypted-storage-ready.target    (the barrier the Proxmox daemons gate on)
+#
+# We intentionally do NOT gate the import on every dev-mapper-crypt\x2d*.device
+# (that is the doc's FAIL-CLOSED variant — one missing disk fails the whole
+# import).  Instead the unlock service decides per-disk (missing device vs Tang
+# failure, with retries), the scan import takes whatever decrypted, and the
+# pool-health check is the single viability gate: a degraded mirror still boots,
+# an unimportable pool keeps the Proxmox daemons stopped.  Because the gate is
+# the unlock SERVICE (not per-device units), no \x2d unit-name escaping is needed.
 #
 # Idempotent and safe on already-encrypted live systems.
 
-# ── clevis-luks-askpass network gate ───────────────────────────────────────
-# Belt-and-suspenders: clevis will not attempt Tang until the network is fully
-# online, regardless of crypttab ordering.
+# ── networking-services bring-up gate ───────────────────────────────────────
+# Not all local file systems need to be in place for networking to start.  Bring
+# the network up as early as possible so Clevis can reach the Tang server(s).
+- name: "Create systemd drop-in directory for networking.service"
+  ansible.builtin.file:
+    path: /etc/systemd/system/networking.service.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
 
+- name: "Bring up networking as early as possible"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/networking.service.d/10-override.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      After=
+      After=network-pre.target apparmor.service ifupdown2-pre.service sysinit.target
+  notify: "Reload systemd daemon"
+
+# ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
 - name: "Create systemd drop-in directory for clevis-luks-askpass"
   ansible.builtin.file:
     path: /etc/systemd/system/clevis-luks-askpass.service.d
@@ -33,57 +65,139 @@
       Wants=network-online.target
   notify: "Reload systemd daemon"
 
-# ── ZFS import ordering ─────────────────────────────────────────────────────
-# remote-cryptsetup.target with nofail is satisfied as soon as crypt units
-# START, not when they COMPLETE, so it cannot reliably gate ZFS import.  Anchor
-# each ZFS import unit on the individual per-disk systemd-cryptsetup@ units and
-# guard with ConditionPathExists on every mapper — if any mapper is absent after
-# all crypt units have run, the import unit is SKIPPED rather than importing a
-# degraded pool, keeping the node accessible for operator intervention.
-#
-# Three units are covered (zfs-import-cache, zfs-import-scan, zfs-import@) so the
-# correct unit runs regardless of which import path systemd picks.
-
-- name: "Create systemd drop-in directories for ZFS import units"
-  ansible.builtin.file:
-    path: "/etc/systemd/system/{{ item }}.d"
-    state: directory
-    mode: '0755'
+# ── Retry-driven, fail-degraded unlock ──────────────────────────────────────
+- name: "Deploy fail-degraded Clevis unlock script"
+  ansible.builtin.template:
+    src: clevis-unlock-data.sh.j2
+    dest: /usr/local/sbin/clevis-unlock-data
     owner: root
     group: root
-  loop:
-    - zfs-import-cache.service
-    - zfs-import-scan.service
-    - zfs-import@.service
+    mode: '0755'
 
-- name: "ZFS import units: wait for individual LUKS mappers, skip if any absent"
+- name: "Deploy clevis-unlock-data.service"
   ansible.builtin.copy:
-    dest: "/etc/systemd/system/{{ item }}.d/after-luks-unlock.conf"
+    dest: /etc/systemd/system/clevis-unlock-data.service
     owner: root
     group: root
     mode: '0644'
     content: |
       [Unit]
-      # Wait for every individual LUKS device service to complete (open or
-      # timed out) before attempting pool import.  remote-cryptsetup.target
-      # with nofail is satisfied when units START, not complete — it cannot
-      # reliably gate ZFS import.
-      #
-      # ConditionPathExists= lines: if any mapper device is absent after all
-      # crypt units have run, this unit is skipped rather than importing the
-      # pool with missing members.  The node remains accessible but ZFS is not
-      # mounted — no silent degraded imports.
-      {% for disk in clevis_raw_disks %}
-      After=systemd-cryptsetup@crypt-{{ disk }}.service
-      {% endfor %}
-      {% for disk in clevis_raw_disks %}
-      ConditionPathExists=/dev/mapper/crypt-{{ disk }}
-      {% endfor %}
-  loop:
-    - zfs-import-cache.service
-    - zfs-import-scan.service
-    - zfs-import@.service
+      Description=Unlock Clevis/Tang LUKS data disks (fail-degraded, with retries)
+      Documentation=file:///usr/local/sbin/clevis-unlock-data
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/clevis-unlock-data
+      # Bounded worst case: retries * (attempt_timeout + delay) per disk * disks,
+      # plus a buffer, so systemd never kills the script mid-retry.
+      TimeoutStartSec={{ (clevis_unlock_retries | int)
+                         * (clevis_unlock_attempt_timeout | int + clevis_unlock_retry_delay | int)
+                         * (clevis_raw_disks | length | int) + 120 }}
+
+      [Install]
+      WantedBy=zfs-import.target
   notify: "Reload systemd daemon"
+
+# ── Scan-based import (stateless; replaces cache-based) ─────────────────────
+- name: "Create zfs-import-scan.service drop-in directory"
+  ansible.builtin.file:
+    path: /etc/systemd/system/zfs-import-scan.service.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: "Gate scan import on the unlock attempt; import stateless (cachefile=none)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/zfs-import-scan.service.d/override.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      # Wait for the (fail-degraded) unlock attempt to finish, then import
+      # whatever decrypted.  Requires= on the unlock SERVICE (which always
+      # succeeds), NOT on per-device units, so a degraded mirror still imports.
+      Requires=clevis-unlock-data.service
+      After=clevis-unlock-data.service
+
+      [Service]
+      ExecStart=
+      ExecStart=/sbin/zpool import -aN -d /dev/mapper -o cachefile=none
+  notify: "Reload systemd daemon"
+
+# ── Pool-health viability gate (the real fail-closed point) ─────────────────
+- name: "Deploy encrypted-storage pool-health check script"
+  ansible.builtin.template:
+    src: encrypted-storage-pool-check.sh.j2
+    dest: /usr/local/sbin/encrypted-storage-pool-check
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Deploy encrypted-storage-pool-check.service"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encrypted-storage-pool-check.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Verify encrypted ZFS pool {{ clevis_pool_name }} imported and usable
+      After=zfs-import-scan.service zfs-mount.service zfs.target
+      Requires=zfs-import-scan.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # ONLINE or DEGRADED -> usable (degraded mirror still serves I/O); absent /
+      # FAULTED / UNAVAIL -> exit 1 so the barrier is NOT reached and the Proxmox
+      # daemons stay stopped for manual recovery.
+      ExecStart=/usr/local/sbin/encrypted-storage-pool-check
+  notify: "Reload systemd daemon"
+
+# ── The synchronization barrier ─────────────────────────────────────────────
+- name: "Deploy encrypted-storage-ready.target (synchronization barrier)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encrypted-storage-ready.target
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Encrypted ZFS Storage Synchronization Barrier
+      Documentation=man:systemd.special(7)
+      # Reached only when the pool is imported and usable (full or degraded).
+      Requires=encrypted-storage-pool-check.service
+      After=encrypted-storage-pool-check.service
+  notify: "Reload systemd daemon"
+
+# ── Remove the obsolete cache-based / fail-closed drop-ins ──────────────────
+# The old after-luks-unlock.conf carried ConditionPathExists for EVERY mapper
+# (fail-closed) which would block a degraded import — must be removed.
+- name: "Remove obsolete fail-closed / cache-based ZFS import drop-ins"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
+    - /etc/systemd/system/zfs-import-cache.service.d/override.conf
+    - /etc/systemd/system/zfs-import-scan.service.d/after-luks-unlock.conf
+    - /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
+  notify: "Reload systemd daemon"
+
+- name: "Switch ZFS import from cache-based to scan-based"
+  ansible.builtin.systemd:
+    name: "{{ item.unit }}"
+    enabled: "{{ item.enabled }}"
+  loop:
+    - { unit: zfs-import-cache.service, enabled: false }
+    - { unit: zfs-import-scan.service, enabled: true }
+    - { unit: clevis-unlock-data.service, enabled: true }
+  ignore_errors: "{{ ansible_check_mode }}"
 
 - name: "Enable clevis-luks-askpass.path for late-boot unlock"
   ansible.builtin.systemd:
