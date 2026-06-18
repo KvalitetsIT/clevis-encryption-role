@@ -79,11 +79,17 @@
         disk_device: "{{ clevis_replace_new }}"
 
     - name: "Replace disk | derive the old device name for crypttab cleanup"
+      # Strip everything up to and including 'crypt-' to get the bare device
+      # name.  Avoid a '\1' backreference: Jinja parses '\1' in a string literal
+      # as chr(1), not a regex group (the bug that broke setup-pool's vdev spec).
+      # When clevis_replace_old is a GUID (no 'crypt-'), there is no name to
+      # clean up, so resolve to '' and skip the removal task below.
       ansible.builtin.set_fact:
         _rp_old_device: >-
           {{ clevis_replace_old_device
-             | default(clevis_replace_old | regex_search('crypt-([A-Za-z0-9]+)', '\1') | default(['']) | first, true)
-             | default('', true) }}
+             | default(
+                 (clevis_replace_old | regex_replace('^.*crypt-', '')) if ('crypt-' in clevis_replace_old) else '',
+                 true) }}
 
     - name: "Replace disk | remove stale crypttab entry for the old device"
       ansible.builtin.lineinfile:

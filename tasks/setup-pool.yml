@@ -44,7 +44,11 @@
   #   stripe  → dev0 dev1 dev2 ...                        (no keyword)
   ansible.builtin.set_fact:
     _clevis_vdev_spec: >-
-      {%- set devs = clevis_raw_disks | map('regex_replace', '^(.*)$', '/dev/mapper/crypt-\1') | list -%}
+      {# Prepend the mapper prefix by replacing the start-of-string anchor.
+         Do NOT use a '\1' backreference here: Jinja parses '\1' in a string
+         literal as the octal escape chr(1), not a regex group reference, which
+         produced '/dev/mapper/crypt-\x01' for every disk and broke zpool create. #}
+      {%- set devs = clevis_raw_disks | map('regex_replace', '^', '/dev/mapper/crypt-') | list -%}
       {%- if clevis_zfs_pool_topology == 'mirror' -%}
         {%- set vdevs = [] -%}
         {%- for i in range(0, devs | length, 2) -%}
