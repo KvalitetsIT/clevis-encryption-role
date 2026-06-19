@@ -47,6 +47,8 @@
     group: root
     mode: '0644'
     content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
       [Unit]
       After=network-online.target
       Wants=network-online.target
@@ -68,6 +70,8 @@
     group: root
     mode: '0644'
     content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Unlock Clevis/Tang LUKS data disks (fail-degraded, with retries)
       Documentation=file:///usr/local/sbin/clevis-unlock-data
@@ -102,6 +106,8 @@
     group: root
     mode: '0644'
     content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Import the encrypted ZFS data pool ({{ clevis_pool_name }})
       Requires=clevis-unlock-data.service
@@ -131,6 +137,8 @@
     group: root
     mode: '0644'
     content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Verify encrypted ZFS pool {{ clevis_pool_name }} imported and usable
       Requires=encrypted-storage-import.service
@@ -152,6 +160,8 @@
     group: root
     mode: '0644'
     content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Encrypted ZFS Storage Synchronization Barrier
       Documentation=man:systemd.special(7)
