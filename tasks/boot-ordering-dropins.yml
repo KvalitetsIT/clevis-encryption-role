@@ -47,7 +47,7 @@
     group: root
     mode: '0644'
     content: |
-      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
       # Do not edit by hand; regenerated on each role run.
       [Unit]
       After=network-online.target
@@ -70,7 +70,7 @@
     group: root
     mode: '0644'
     content: |
-      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
       # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Unlock Clevis/Tang LUKS data disks (fail-degraded, with retries)
@@ -106,7 +106,7 @@
     group: root
     mode: '0644'
     content: |
-      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
       # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Import the encrypted ZFS data pool ({{ clevis_pool_name }})
@@ -137,7 +137,7 @@
     group: root
     mode: '0644'
     content: |
-      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
       # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Verify encrypted ZFS pool {{ clevis_pool_name }} imported and usable
@@ -160,7 +160,7 @@
     group: root
     mode: '0644'
     content: |
-      # Managed by Ansible role: clevis_encryption — https://github.com/alc-kit/clevis-encryption-role
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
       # Do not edit by hand; regenerated on each role run.
       [Unit]
       Description=Encrypted ZFS Storage Synchronization Barrier
