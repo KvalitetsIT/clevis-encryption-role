@@ -26,13 +26,18 @@ This role was written specifically for the Debian/initramfs-tools path and
 addresses several real-world problems that are not covered by existing public
 automation:
 
-- The correct `crypttab` flag combination for network-unlocked devices
-  (`_netdev,x-systemd.after=network-online.target`) and why `noauto` breaks
-  things
-- Ordering `zfs-import-cache.service` after `remote-cryptsetup.target` so ZFS
-  never races the unlock
-- A clevis-scoped IP-family pin (via a `curlrc`) for dual-stack hosts where
-  Tang servers are reachable over only one of IPv4 / IPv6
+- The correct `crypttab` flag combination for Tang-unlocked data disks
+  (`noauto,_netdev,x-systemd.after=network-online.target`) — these disks are
+  opened in the booted system by a dedicated fail-degraded unlock service, not
+  by `systemd-cryptsetup` in early boot
+- A self-contained, network-ordered boot chain (`clevis-unlock-data` →
+  `encrypted-storage-import` → pool-health check → a `…-ready.target` barrier)
+  that imports the encrypted pool *after* the network is up, deliberately
+  **decoupled** from the stock early `zfs-import` units so it cannot form the
+  systemd ordering cycle that would otherwise delete the unlock job
+- A clevis-scoped IP-family pin (via a `curlrc`) — the role's primary
+  network-handling mechanism — so the Tang `curl` call uses the IPv4/IPv6 family
+  that actually serves a valid advertisement on dual-stack hosts
   (`clevis_curl_ip_version`)
 - Shamir Secret Sharing (SSS) across multiple Tang servers for HA unlock
   without requiring all servers to be available simultaneously
@@ -64,10 +69,14 @@ automation:
 | `clevis_pool_name` | `"data"` | Name of the ZFS pool created on top of the encrypted devices. |
 | `clevis_zfs_pool_topology` | `"mirror"` | Vdev layout. See [ZFS pool topology](#zfs-pool-topology). |
 | `clevis_install_zfs_packages` | `true` | Install the ZFS userland + initramfs integration (`zfsutils-linux`, `zfs-initramfs`) during prestage. ZFS is the higher-level consumer of the LUKS/Clevis devices, so its packages are a separable concern — set `false` when another role/base image already owns ZFS, or in environments that cannot build the ZFS kernel module (e.g. the container test). Does **not** create a pool; that is `clevis_ensure_pool`. |
+| `clevis_ensure_pool` | `true` | Open the LUKS mappers and create/import the ZFS pool (runs on every full invocation, outside the recovery-key gate). Set `false` to skip pool management entirely — e.g. when ZFS is owned elsewhere, or for the container tests. |
 | `clevis_vault_password_file` | `"~/.ansible_vault_pass"` | Path to the Ansible Vault password file on the controller, used to encrypt the per-host recovery key. |
 | `clevis_keep_temp_key` | `false` | Retain `/tmp/ansible_luks_key` on the remote host after provisioning. Leave `false` in production. |
 | `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |
 | `clevis_luks_open_options` | `"--allow-discards"` | Options passed to `cryptsetup open` when `clevis-unlock-data` opens each mapper at boot (`clevis luks unlock -o`). The durable place to enable discard, since the `noauto` data disks ignore the crypttab `discard` option. Append `--perf-no_read_workqueue --perf-no_write_workqueue` to make dm-crypt perf flags durable too; set `""` for none. |
+| `clevis_unlock_retries` | `3` | Boot-time `clevis-unlock-data`: number of Tang unlock attempts per disk before giving up (fail-degraded) and moving on. |
+| `clevis_unlock_retry_delay` | `5` | Seconds to wait between boot-time unlock attempts. |
+| `clevis_unlock_attempt_timeout` | `20` | Per-attempt timeout (seconds) wrapped around each boot-time `clevis luks unlock`. |
 | `clevis_dns_servers` | `[]` | Nameservers to prepend to `/etc/resolv.conf` during provisioning. Useful when Tang is reachable only via an internal DNS zone not in the host's default resolver. Empty = no change. |
 | `clevis_curl_ip_version` | `auto` | IP family clevis's curl uses for Tang: `auto` (probe and pin the working family), `ipv4`, `ipv6`, or `dual` (no pin). See [Tang IP family](#tang-ip-family-ipv4--ipv6). |
 | `clevis_curl_home` | `/etc/clevis/curl` | Directory used as `CURL_HOME` for clevis's curl calls; the role writes `<clevis_curl_home>/.curlrc` here. |
@@ -148,7 +157,7 @@ This replaces the previous host-global approach (`/etc/gai.conf` IPv4 precedence
 which disabled IPv6 for the entire host and was silently ignored when the host
 used `systemd-resolved` (which does its own RFC 6724 sort and never consults
 `gai.conf`).  Those artifacts are removed on every run — see
-[Upgrade notes](#removed-host-global-ipv4-only-gate).
+[Upgrade notes](#automatic-legacy-cleanup).
 
 ## Tags
 
@@ -284,30 +293,47 @@ drop-ins without touching the LUKS key slots.
 
 ## How boot unlock works
 
+The data disks carry `noauto` in `/etc/crypttab`, so `systemd-cryptsetup` does
+**not** open them in early boot.  Instead the role installs a self-contained,
+network-ordered chain that runs in the booted system.  It is deliberately
+**decoupled** from the stock early `zfs-import` machinery: ordering the early
+`zfs-import` units after a network-dependent unlock creates a systemd ordering
+cycle (`local-fs → zfs-mount → zfs-import → [net dep] → network-online →
+networking → local-fs`), which systemd breaks by *deleting* a job — in practice
+the unlock job, so nothing decrypts.  Keeping our chain out of that graph avoids
+the cycle:
+
 ```
 network-online.target
-                         │
-                         ▼
-         clevis-luks-askpass.service
-         (fetches Tang adv, unlocks LUKS; curl reads the role curlrc
-          via CURL_HOME so the pinned IP family is used)
-                         │
-                         ▼
-         remote-cryptsetup.target
-         (reached when all crypt units unlock or time out)
-                         │
-                         ▼
-         zfs-import-cache.service
-         (imports pool from /etc/zfs/zpool.cache)
-                         │
-                         ▼
-         zfs-mount.service → dependent services
+        │
+        ▼
+clevis-unlock-data.service          retries Tang per disk; distinguishes a
+        │                            MISSING DEVICE from a DECRYPT FAILURE;
+        │                            opens each mapper with --allow-discards;
+        │                            ALWAYS exits 0.  curl reads the role curlrc
+        │                            via CURL_HOME, so the pinned IP family is used.
+        ▼
+encrypted-storage-import.service    zpool import -d /dev/mapper -o cachefile=none
+        │
+        ▼
+encrypted-storage-pool-check.service  pool health ONLINE|DEGRADED → ok;
+        │                              otherwise exit 1 (barrier NOT reached).
+        ▼
+encrypted-storage-ready.target      synchronization barrier
+                                    (WantedBy=multi-user.target); dependent
+                                    services (e.g. Proxmox pvestatd) gate on it.
 ```
 
-The `nofail` crypttab flag ensures boot continues even if Tang is unreachable
-(e.g. Tang server maintenance).  The disk will not be unlocked in that case and
-services depending on the pool will fail, but the host itself boots to a
-recoverable state.
+The unlock is **fail-degraded**: a disk that is missing, or whose Tang is
+unreachable after `clevis_unlock_retries` attempts, is logged and skipped rather
+than hanging the boot.  Combined with the `nofail` crypttab flag, the host always
+boots to a recoverable state — if Tang is down the pool simply does not come up,
+`encrypted-storage-pool-check` fails, and `encrypted-storage-ready.target` is not
+reached, so services gated on it stay stopped until you intervene.
+
+The stock `zfs-import-cache.service` is left at its distro default (enabled);
+with `cachefile=none` the encrypted data pool is not in the cache, so the early
+cache import no-ops and this late chain owns the import.
 
 ## Compatibility
 
@@ -368,60 +394,92 @@ superseded by the clevis-scoped `curlrc` — see
 
 ## Testing
 
-The role ships with a [Molecule](https://ansible.readthedocs.io/projects/molecule/)
-test suite under `molecule/default/`.  It uses the Docker driver with a
-privileged Debian 13 (Trixie) container that has `systemd` as PID 1.
+The role ships **two** [Molecule](https://ansible.readthedocs.io/projects/molecule/)
+scenarios, one per layer of the stack.  Both use the Docker driver with a
+privileged Debian 13 (Trixie) container running `systemd` as PID 1.
+
+| Scenario | Layer under test | Block device? | Runtime |
+|---|---|---|---|
+| `molecule/network` | clevis↔Tang **crypto + network** — the IP-family selection this role performs | No | **Rootless** podman/Docker, any CI |
+| `molecule/default` | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | Yes (loopback) | **Rootful** (see below) |
+
+The split mirrors how clevis works: `clevis encrypt`/`decrypt` round-trip with
+Tang over `curl` (the network layer — no disk, no privilege), while binding a key
+to a LUKS keyslot needs a real block device.  The `network` scenario runs the
+**same role** device-free (`clevis_raw_disks: []`), so the network handling — the
+subject of `clevis_curl_ip_version` — is testable anywhere.
+
+> **Why `default` needs rootful.** Setting up a loopback LUKS device requires
+> creating a `/dev/loop*` node and `CAP_SYS_ADMIN` against the initial namespace.
+> Rootless containers run in a user namespace where the kernel forbids
+> block-device `mknod`, so the `default` scenario must run under a rootful
+> runtime — e.g. CI with the Docker daemon, or `sudo`. The `network` scenario has
+> no such requirement.
 
 ### Prerequisites
 
 ```bash
-pip install molecule molecule-plugins[docker] ansible
+pip install molecule 'molecule-plugins[docker]' ansible
+ansible-galaxy collection install community.docker ansible.posix
 ```
 
-Docker must be running on the controller.
+A container runtime (Docker, or Podman exposing the Docker-compatible socket via
+`DOCKER_HOST`) must be available.
 
 ### Running the tests
 
 ```bash
 cd ansible/roles/clevis-encryption
-molecule test
+
+# Tier-0 — device-free, rootless: the network / IP-family behaviour
+molecule test -s network
+
+# Tier-1 — loopback LUKS; needs a rootful runtime
+sudo molecule test            # the 'default' scenario
 ```
 
-`molecule test` runs the full lifecycle: `create → prepare → converge → verify → destroy`.
-
-To iterate faster during development:
-
-```bash
-molecule converge   # apply role changes to a running instance
-molecule verify     # re-run assertions without re-converging
-molecule destroy    # tear down the container
-```
+`molecule test` runs the full lifecycle (`create → prepare → converge →
+idempotence → verify → destroy`).  To iterate, use
+`molecule converge -s <scenario>` then `molecule verify -s <scenario>`.
 
 ### What is tested
 
-The test suite focuses on the **boot-ordering block** (always runs, idempotent):
+**`network`** (device-free):
 
-- `/etc/crypttab` contains a correct entry for the loopback device with all
-  required flags (`_netdev`, `x-systemd.after=network-online.target`, `discard`,
-  `nofail`)
+- the role's auto-probe resolves the family and writes
+  `/etc/clevis/curl/.curlrc` pinning `--ipv4` (the test Tang is IPv4-only)
+- `clevis encrypt | clevis decrypt` round-trips through that curlrc, and forcing
+  `--ipv6` **fails** — proving the pin is actually read and is decisive
+- the device-independent boot-ordering artifacts are deployed
+  (the `clevis-luks-askpass` network-online gate and `clevis-unlock-data.service`)
+
+**`default`** (loopback LUKS):
+
+- `/etc/crypttab` has the expected `crypt-loop0` entry with `_netdev`,
+  `x-systemd.after=network-online.target`, `discard`, and `nofail`
 - `/dev/mapper/crypt-loop0` is open and `discards` is active in the dm-crypt table
-- `/etc/clevis/curl/.curlrc` pins `--ipv4` (because `clevis_curl_ip_version: ipv4`
-  is set in the test scenario)
+  (the live-apply path)
+- the auto-probe pinned `--ipv4` against the IPv4-only test Tang
 - the retired `gai.conf` block, `clevis-network-ready.service`, and
-  `clevis-luks-askpass.service.d/ipv4-only.conf` are **absent**
-- `clevis-luks-askpass.service.d/network-online.conf` drop-in is deployed
+  `clevis-luks-askpass.service.d/ipv4-only.conf` are **absent**, while a foreign
+  same-named drop-in is **preserved** (content-guard test)
+- a vendored harness proves `clevis luks unlock -o "--allow-discards"` and the
+  live-refresh path land `allow_discards`
 
-The provisioning block (LUKS format, Clevis bind, ZFS pool creation) is skipped
-in the test because `prepare.yml` pre-creates the recovery key file — the same
-mechanism that prevents re-provisioning on live nodes.
+In both scenarios the provisioning block (LUKS format on real disks, Clevis bind,
+ZFS pool creation) is skipped because `prepare.yml` pre-creates the recovery-key
+file — the same mechanism that prevents re-provisioning on live nodes.  ZFS is out
+of scope for the container tier (`clevis_install_zfs_packages: false`,
+`clevis_ensure_pool: false`); it is the higher-level consumer and belongs in a
+future VM-based scenario.
 
 ### How disk mocking works
 
-The disk discovery task in `tasks/main.yml` carries a
-`when: clevis_raw_disks is not defined` guard.  The Molecule `host_vars` in
-`molecule.yml` pre-set `clevis_raw_disks: [loop0]`, so the task is skipped and
-the role operates on the loopback device rather than trying to inspect
-`ansible_devices` (which is unreliable in containers).
+`tasks/main.yml`'s disk-discovery task carries `when: clevis_raw_disks is not
+defined`.  The `default` scenario pre-sets `clevis_raw_disks: [loop0]` (the
+loopback LUKS device); the `network` scenario sets `clevis_raw_disks: []` so the
+per-disk loops are empty and nothing touches a block device.  Either way the role
+never inspects `ansible_devices`, which is unreliable in containers.
 
 ## Troubleshooting
 
@@ -484,7 +542,7 @@ in `/etc/gai.conf` and disabled IPv6 host-wide. That disabled IPv6 for everythin
 on the box and — crucially — was silently ignored under `systemd-resolved`
 (`/etc/resolv.conf` → `127.0.0.53`), which does its own RFC 6724 sort and never
 consults `gai.conf`. The curlrc pin is scoped to clevis and is immune to both
-problems. See [Upgrade notes](#removed-host-global-ipv4-only-gate)
+problems. See [Upgrade notes](#automatic-legacy-cleanup)
 for cleanup of the old artifacts (handled automatically on the next run).
 
 ---
@@ -504,24 +562,33 @@ version of this role.
 
 ---
 
-### Boot unlock hangs or loops (Tang unreachable)
+### Boot unlock fails (Tang unreachable)
 
 If Tang is unreachable at boot time:
 
-- The `nofail` crypttab flag allows `remote-cryptsetup.target` to be reached
-  without the disk being unlocked.
-- `ConditionPathExists=/dev/mapper/crypt-<disk>` on the ZFS import drop-ins
-  causes ZFS import to be **skipped** rather than attempting to import a
-  degraded or missing pool.
-- The host boots to `multi-user.target` without ZFS, remaining accessible
-  for operator intervention.
+- `clevis-unlock-data.service` retries each disk a bounded number of times
+  (`clevis_unlock_retries` × `clevis_unlock_attempt_timeout`), logs the failure,
+  and exits 0 — the boot is never blocked on it.
+- `encrypted-storage-import.service` still runs; if the pool cannot be imported
+  (or imports FAULTED/UNAVAIL) `encrypted-storage-pool-check.service` exits 1 and
+  `encrypted-storage-ready.target` is **not** reached, so services that gate on
+  it (e.g. Proxmox `pvestatd`) stay stopped rather than running against a missing
+  pool.
+- The host still boots to `multi-user.target` and remains accessible for operator
+  intervention.
 - To unlock manually after fixing Tang connectivity:
 
 ```bash
-clevis luks unlock -d /dev/<device>
-# then import the pool:
-zpool import <pool-name>
+# Re-run the role's fail-degraded unlock + import chain:
+systemctl start clevis-unlock-data.service encrypted-storage-import.service
+
+# …or do it by hand for a single disk:
+clevis luks unlock -d /dev/<device> -n crypt-<device> -o "--allow-discards"
+zpool import -d /dev/mapper <pool-name>
 ```
+
+Inspect what happened with `journalctl -u clevis-unlock-data -u
+encrypted-storage-import -u encrypted-storage-pool-check`.
 
 ## License
 
