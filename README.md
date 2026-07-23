@@ -42,7 +42,7 @@ Two consumer roles implement this contract:
 
 | Consumer role | Backend | Where |
 |---|---|---|
-| `encrypted_storage_pool` | generic **btrfs / LVM** (mainline, no DKMS) | <https://github.com/alc-kit/encrypted-storage-pool> |
+| `encrypted_storage_pool` | generic **btrfs / LVM** (mainline, no DKMS) | <https://github.com/KvalitetsIT/encrypted-storage-pool> |
 | `proxmox_encrypted_storage` | **ZFS** (Proxmox VE) | in the `proxmox-install` repo |
 
 Pick `encrypted_storage_pool` for a generic btrfs/LVM pool; pick
@@ -278,7 +278,7 @@ them. Add a consumer role (below) to get a usable pool.
 
     # 2. Consumer: assembles a btrfs raid1 across the mappers, ordered after
     #    clevis-luks-unlocked.target, and emits encrypted-storage-ready.target.
-    #    (github.com/alc-kit/encrypted-storage-pool)
+    #    (github.com/KvalitetsIT/encrypted-storage-pool)
     - role: encrypted_storage_pool
       vars:
         encrypted_storage_pool_backend: btrfs
@@ -425,7 +425,7 @@ longer exist** in this role:
   `clevis_pool_name`/`clevis_zfs_pool_topology`, but set the new names at your
   convenience.
 - **Generic btrfs/LVM users:** add the `encrypted_storage_pool` role
-  (<https://github.com/alc-kit/encrypted-storage-pool>) after this one.
+  (<https://github.com/KvalitetsIT/encrypted-storage-pool>) after this one.
 - The `encrypted-storage-import`/`-pool-check` units and
   `encrypted-storage-ready.target` are now created by the consumer role, not this
   one. This role deploys only the unlock half + the `clevis-luks-unlocked.target`
