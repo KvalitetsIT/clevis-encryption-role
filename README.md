@@ -225,8 +225,9 @@ ansible-vault decrypt \
   inventories/<customer>/<env>/host_vars/<hostname>/secrets/luks_recovery_key.txt \
   --vault-password-file ~/.ansible_vault_pass \
   --output -
-# Use the printed passphrase with:
-cryptsetup luksOpen /dev/<device> crypt-<device>
+# Use the printed passphrase with (the mapper is named crypt-<LUKS-UUID>):
+uuid=$(cryptsetup luksUUID /dev/<device>)
+cryptsetup luksOpen /dev/<device> "crypt-$uuid"
 ```
 
 ## Example playbooks
@@ -324,6 +325,18 @@ drop-ins (including the `clevis-luks-unlocked.target` seam) without touching the
 LUKS key slots.
 
 ## How boot unlock works
+
+### Mapper naming
+
+Each data disk's dm-crypt mapper is named **`crypt-<LUKS-UUID>`** — derived from
+the disk's own immutable LUKS header UUID, not the kernel device node. Node names
+(`nvme3n1`) are unstable across reboots and controller re-enumeration; the LUKS
+UUID is fixed and is the same key `/etc/crypttab` already joins on, so the mapper
+name never drifts and a re-apply is idempotent. Legacy `crypt-<device-node>`
+crypttab entries are migrated to `crypt-<uuid>` in place the first time the role
+runs after upgrading (the entry is matched by its `UUID=` source, so no line is
+duplicated or orphaned). The human-readable disk identity (serial/by-id) is always
+one hop away via `cryptsetup status crypt-<uuid>` → `/dev/disk/by-id/…`.
 
 The data disks carry `noauto` in `/etc/crypttab`, so `systemd-cryptsetup` does
 **not** open them in early boot.  Instead the role installs a self-contained,
@@ -590,8 +603,10 @@ idempotence → verify → destroy`); the `vm` scenario swaps `idempotence` for 
 Two GitHub Actions workflows:
 
 - **`ci.yml`** (every push / PR): the Tier-0 gate — `yamllint`, `ansible-lint`,
-  an `ansible-core` version matrix syntax-check, and the device-free `network`
-  scenario (Docker). Cheap, no VMs.
+  an `ansible-core` version matrix syntax-check, the device-free `network`
+  scenario (Docker), and the `crypttab-guard` regression test (the crypttab
+  UUID-collision audit script + the pre-flight assertions, device-free). Cheap,
+  no VMs.
 - **`vm-tests.yml`** (PRs touching role/test code, or manual dispatch): Tiers 1–2
   (`default`, `vm`) on libvirt/KVM. It bootstraps libvirt + Vagrant +
   `vagrant-libvirt` on the runner and needs nested KVM (`/dev/kvm`).
@@ -607,11 +622,21 @@ Two GitHub Actions workflows:
 - the device-independent boot-ordering artifacts are deployed
   (the `clevis-luks-askpass` network-online gate and `clevis-unlock-data.service`)
 
+**`crypttab-guard`** (device-free):
+
+- the audit script (`files/crypttab-uuid-audit.sh`) exits `2` on a duplicate
+  UUID and on a stale/orphan UUID, `3` on a merely-unrepresented `crypto_LUKS`
+  device, and `0` on a clean crypttab — run against fixtures in offline
+  (`--devmap`) mode
+- the role's pre-flight assertions (`tasks/assert-crypttab-unique.yml`) fail the
+  play for a duplicate-UUID or unformatted-device set and pass for a unique,
+  valid one — exercised with injected `clevis_crypttab_pairs` fixtures
+
 **`default`** (real virtio-disk LUKS):
 
-- `/etc/crypttab` has the expected `crypt-vdb` entry with `_netdev`,
+- `/etc/crypttab` has the expected `crypt-<uuid>` entry with `_netdev`,
   `x-systemd.after=network-online.target`, `discard`, and `nofail`
-- `/dev/mapper/crypt-vdb` is open and `discards` is active in the dm-crypt table
+- `/dev/mapper/crypt-<uuid>` is open and `discards` is active in the dm-crypt table
   (the live-apply path)
 - the auto-probe pinned `--ipv4` against the IPv4-only test Tang
 - the retired `gai.conf` block, `clevis-network-ready.service`, and
@@ -622,7 +647,7 @@ Two GitHub Actions workflows:
 
 **`vm`** (real boot ordering, post-reboot — clevis NBDE + btrfs consumer):
 
-- both `crypt-vdb` / `crypt-vdc` mappers are open after boot with `allow_discards`
+- both data-disk `crypt-<uuid>` mappers are open after boot with `allow_discards`
   still set (durable across the reboot, not just the live-apply)
 - `clevis-luks-unlocked.target` is active and systemd logged "Reached target"
   this boot — the public NBDE seam
@@ -755,12 +780,72 @@ If Tang is unreachable at boot time:
 systemctl start clevis-unlock-data.service
 systemctl start clevis-luks-unlocked.target   # (or the consumer's assemble unit)
 
-# …or open a single disk by hand (pool import/assembly is the consumer's concern):
-clevis luks unlock -d /dev/<device> -n crypt-<device> -o "--allow-discards"
+# …or open a single disk by hand (mapper name = crypt-<LUKS-UUID>; pool
+# import/assembly is the consumer's concern):
+uuid=$(cryptsetup luksUUID /dev/<device>)
+clevis luks unlock -d /dev/<device> -n "crypt-$uuid" -o "--allow-discards"
 ```
 
 Inspect what happened with `journalctl -u clevis-unlock-data
 -u clevis-luks-unlocked.target`.
+
+---
+
+### A mapper never appears / a mirror member is `UNAVAIL` every boot (crypttab UUID collision)
+
+**Symptom:** After every reboot a consumer that expects `/dev/mapper/crypt-<dev>`
+finds it missing — e.g. `zpool status` shows one mirror member `UNAVAIL` ("was
+/dev/mapper/crypt-nvme7n1") while the physical disk is healthy and LUKS-unlocked,
+just under a different mapper name.
+
+**Cause:** two `/etc/crypttab` targets carry the **same LUKS UUID**, or an entry
+carries a UUID that no longer belongs to any device. At boot both units resolve
+the same `/dev/disk/by-uuid` device; one mapper wins and the other silently fails
+(masked by `nofail`), so the expected mapper name is never created. This is a
+static crypttab authoring bug (a duplicated/stale UUID), not an enumeration race —
+it reproduces deterministically every boot.
+
+**Guardrails in this role.** The role now derives every crypttab UUID from live
+`blkid` at apply time and, before writing crypttab, runs a **pre-flight assert**
+(`tasks/validate-crypttab.yml`) that fails the play on a duplicate or unresolved
+UUID. After writing, it installs and runs a **post-deploy audit**
+(`tasks/verify-crypttab.yml`) that cross-references the whole crypttab against the
+live devices. UUID is the correct stable join key — the role never keys off the
+unstable `/dev/nvmeXn1` names and never silently rewrites a UUID from device-node
+guessing.
+
+**Audit any host (ad hoc / cron / fleet-wide).** The audit tool is installed at
+`/usr/local/sbin/crypttab-uuid-audit.sh` and is also runnable straight from the
+repo (`files/crypttab-uuid-audit.sh`):
+
+```bash
+# Exit 0 = clean, 2 = hard finding (duplicate / stale / crossed live mapper),
+# 3 = soft only (a crypto_LUKS device with no crypttab entry).
+/usr/local/sbin/crypttab-uuid-audit.sh
+
+# Fleet-wide via Ansible ad-hoc (non-zero rc flags the offending hosts):
+ansible proxmox -b -m command -a /usr/local/sbin/crypttab-uuid-audit.sh
+```
+
+**Remediating an already-degraded host.** The role guards *new* writes but does
+not auto-rewrite an existing bad crypttab (a node-name-based auto-fix would
+reintroduce the instability). Correct it by hand, keying off `blkid` truth:
+
+```bash
+# 1. Establish truth: which physical device really holds which LUKS UUID.
+blkid -o value -s UUID /dev/nvme7n1          # -> the real UUID for that disk
+crypttab-uuid-audit.sh                        # -> shows the duplicate/stale lines
+
+# 2. Fix /etc/crypttab: give each crypt-<dev> target its device's real UUID and
+#    delete any stale line whose UUID is on no device. Then:
+systemctl daemon-reload
+systemctl start 'systemd-cryptsetup@crypt\x2dnvme7n1.service'   # or clevis-unlock-data
+ls -l /dev/mapper/crypt-nvme7n1               # confirm the mapper now appears
+crypttab-uuid-audit.sh && echo "crypttab clean"
+
+# 3. Rejoin the consumer (ZFS example) and confirm it survives a reboot.
+zpool online data /dev/mapper/crypt-nvme7n1
+```
 
 ## License
 
